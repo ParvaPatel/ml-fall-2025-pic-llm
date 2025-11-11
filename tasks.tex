@@ -1,0 +1,39 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{enumitem}
+
+\title{Core Task Progress Notes}
+\author{Team: \underline{\hspace{2in}}}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section*{Sanity-Check Run}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Command.} \texttt{OMP\_NUM\_THREADS=1 python3 pico-llm.py --tinystories\_weight 0.0 --input\_files 3seqs.txt --block\_size 32 --max\_steps\_per\_epoch 1 --kgram\_k 2 --embed\_size 64 --device\_id cpu}
+  \item \textbf{Environment tweaks.} Installed the missing \texttt{tiktoken} package and pinned OpenMP threads to avoid shared-memory warnings in the sandboxed environment.
+  \item \textbf{Outcome.} Training loop completed three abbreviated epochs for the LSTM baseline on \texttt{3seqs.txt}, producing loss values (10.82 $\rightarrow$ 10.80 $\rightarrow$ 10.77) and sample generations at greedy, $p=0.95$, and $p=1.0$ settings. This confirms data loading, tokenization, model forward/backward, and text generation pathways function end-to-end on CPU-only hardware.
+\end{itemize}
+
+\section*{Key Observations}
+\begin{itemize}[leftmargin=*]
+  \item The current nucleus sampling placeholder yields identical outputs across different $p$ values, reinforcing the need to implement true top-$p$ sampling before the presentation.
+  \item LSTM outputs trained on the minimal dataset remain nonsensical, which is expected given the toy corpus and tiny training budget; future sanity checks on TinyStories or richer data should improve qualitative quality.
+  \item Installing dependencies on the target machine (e.g., \texttt{tiktoken}) should be part of setup instructions to prevent runtime failures during the live demo.
+\end{itemize}
+
+\section*{Sample Interview Questions \& Answers}
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{What did you verify in the sanity-check run, and why did you choose the custom dataset?}\\
+        We confirmed that the default training loop, tokenizer, and generation routines run without crashing on CPU. The \texttt{3seqs.txt} data ships with the repo, so it avoids the network dependency of downloading TinyStories and shortens iteration time.
+  \item \textbf{Why did the generated samples look incoherent, and is that a concern?}\\
+        The dataset contains synthetic numeric sequences and we limited training to one gradient step per epoch. With minimal data and budget, the LSTM cannot learn meaningful structure; the purpose of this run was functionality, not quality. Larger datasets and more steps will address coherence.
+  \item \textbf{You pinned \texttt{OMP\_NUM\_THREADS} to 1---will that hurt performance later?}\\
+        For this quick CPU smoke test it eliminated shared-memory errors. On a full training environment we can remove or raise the cap once OpenMP shared-memory permissions are available, restoring multithreaded BLAS performance.
+  \item \textbf{What additional checks will you run before the presentation?}\\
+        We plan to repeat the sanity check on TinyStories once Transformer and k-gram models are implemented, capture training curves for the required figures, and verify qualitative outputs under true top-$p$ sampling to demonstrate improved diversity.
+\end{enumerate}
+
+\end{document}
+
