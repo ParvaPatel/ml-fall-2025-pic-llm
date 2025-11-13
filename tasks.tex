@@ -63,6 +63,14 @@
   \item \textbf{Test in notebook.} Run the reduced configuration from the sanity check, compare loss trajectories, and profile runtime to confirm expected improvements.
 \end{enumerate}
 
+\section*{Forward Pass Rationale}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Responsibility.} The \texttt{forward()} method ingests a tensor of token IDs with shape (sequence length, batch size), walks through the sequence in micro-batches, extracts the preceding $k$ tokens for each position, pads when history is short, one-hot encodes that context, and ships the flattened vector through the chosen sub-network to obtain logits.
+  \item \textbf{Chunking.} Iterating in blocks of size \texttt{chunk\_size} lowers peak memory usage, making the naive Python loop feasible even for long sequences.
+  \item \textbf{Why it matters.} Without this logic, the k-gram model would never transform context into next-token distributions—no logits means no loss, no gradients, and no generation. This function therefore defines the core behavior we train and evaluate.
+  \item \textbf{Postconditions.} Concatenating the outputs from each chunk restores the expected $(\text{seq\_len}, \text{batch}, |V|)$ tensor that downstream code (loss, sampling) depends on.
+\end{itemize}
+
 \section*{Performance Comparison Strategy}
 \begin{itemize}[leftmargin=*]
   \item \textbf{Feasibility.} It is practical to compare all three architectures visually: log training loss and wall-clock time per step for each variant while running identical hyperparameters, then plot the metrics using \texttt{matplotlib} inside the standalone notebook. GPU execution is optional but accelerates experimentation.
