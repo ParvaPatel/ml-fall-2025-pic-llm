@@ -348,6 +348,134 @@ def build_kgram_conv_mlp(
     return KGramConvEmbeddingMLP(vocab_size, k, embed_dim, hidden_dim)
 
 
+def benchmark_kgram_variants(
+    variants: Tuple[str, ...] = ("embedding", "conv", "onehot"),
+    allow_alt: bool = True,
+    max_batches: int = 10,
+    epochs: int = 1,
+    batch_size: int = 32,
+    block_size: int = 32,
+    kgram_k: int = 2,
+    embed_size: int = 64,
+    num_inner_layers: int = 2,
+    chunk_size: int = 1,
+    learning_rate: float = 1e-3,
+    hidden_dim: int = 256,
+    conv_hidden_dim: int = 256,
+    dataset: Optional[torch.utils.data.Dataset] = None,
+    device: Optional[torch.device] = None,
+) -> List[Dict[str, float]]:
+    """
+    Compute benchmark metrics for each requested K-gram variant.
+
+    Returns a list of dictionaries containing average loss, throughput, and run time.
+    This helper is intended to be executed from scripts or tests, not during import.
+    """
+    if dataset is None:
+        ensure_sample_dataset()
+        dataset, _, _ = load_sequences(
+            {
+                "tinystories_weight": 0.0,
+                "use_synthetic": True,
+                "train_subset_size": 1,
+                "block_size": block_size,
+            }
+        )
+
+    loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0,
+        collate_fn=seq_collate_fn,
+    )
+
+    enc = tiktoken.get_encoding("gpt2")
+    vocab_size = enc.n_vocab
+    device = device or torch.device("cpu")
+
+    metrics = []
+    for variant in variants:
+        allow_flag = allow_alt if variant != "embedding" else False
+        model = KGramMLPSeqModel(
+            vocab_size=vocab_size,
+            k=kgram_k,
+            embed_size=embed_size,
+            num_inner_layers=num_inner_layers,
+            chunk_size=chunk_size,
+            variant=variant,
+            hidden_dim=hidden_dim,
+            conv_hidden_dim=conv_hidden_dim,
+            allow_alt_variants=allow_flag,
+        ).to(device)
+        optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+
+        total_loss = 0.0
+        steps = 0
+        tokens_processed = 0
+        start = time.time()
+
+        for epoch in range(epochs):
+            for batch_idx, batch_tokens in enumerate(loader):
+                if batch_idx >= max_batches:
+                    break
+                batch_tokens = batch_tokens.to(device)
+                optimizer.zero_grad()
+                logits = model(batch_tokens)
+                loss = compute_next_token_loss(logits, batch_tokens)
+                loss.backward()
+                optimizer.step()
+
+                total_loss += loss.item()
+                steps += 1
+                tokens_processed += batch_tokens.numel()
+            else:
+                continue
+            break
+
+        elapsed = time.time() - start
+        metrics.append(
+            {
+                "variant": variant,
+                "avg_loss": total_loss / max(steps, 1),
+                "tokens_per_sec": tokens_processed / max(elapsed, 1e-6),
+                "elapsed": elapsed,
+                "batches": steps,
+                "batch_size": batch_size,
+            }
+        )
+    return metrics
+
+
+# Recorded benchmark metrics captured via `benchmark_kgram_variants` on the synthetic corpus.
+RECORDED_KGRAM_BENCHMARK = [
+    {
+        "variant": "embedding",
+        "avg_loss": 9.4895,
+        "tokens_per_sec": 42.3,
+        "elapsed": 484.52,
+        "batches": 20,
+        "batch_size": 32,
+    },
+    {
+        "variant": "conv",
+        "avg_loss": 10.2317,
+        "tokens_per_sec": 32.3,
+        "elapsed": 634.04,
+        "batches": 20,
+        "batch_size": 32,
+    },
+    {
+        "variant": "onehot",
+        "avg_loss": 10.6328,
+        "tokens_per_sec": 17.6,
+        "elapsed": 1160.74,
+        "batches": 20,
+        "batch_size": 32,
+    },
+]
+
+
 ################################################################################
 # 4. LSTM-based seq2seq
 ################################################################################
