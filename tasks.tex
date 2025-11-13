@@ -72,6 +72,26 @@
   \item \textbf{Postconditions.} Concatenating the outputs from each chunk restores the expected $(\text{seq\_len}, \text{batch}, |V|)$ tensor that downstream code (loss, sampling) depends on.
 \end{itemize}
 
+\section*{Action Plan: Implementing Nucleus Sampling}
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{Normalize logits.} Convert logits to probabilities via \texttt{softmax} to obtain a stable distribution over the vocabulary.
+  \item \textbf{Rank tokens.} Sort probabilities in descending order while keeping token indices to identify the highest-mass prefix.
+  \item \textbf{Cumulative cutoff.} Compute the running probability mass and retain the smallest slice whose sum exceeds the user-specified $p$ threshold.
+  \item \textbf{Renormalize.} Scale the retained probabilities so they sum to one, ensuring a valid categorical distribution.
+  \item \textbf{Sample token.} Draw the next token from the truncated distribution (fall back to the full distribution if $p$ never triggers).
+  \item \textbf{Surface API.} Expose the sampler through \texttt{generate\_text} so notebook experiments can vary $p$ without extra wiring.
+\end{enumerate}
+
+\section*{Nucleus Sampling Observations}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Setup.} Used the quick LSTM sanity-check run (one optimization step on the synthetic corpus) and generated 20 new tokens from the prompt ``Once upon a'' with different top-$p$ thresholds.
+  \item \textbf{Greedy ($p=\text{None}$).} \textit{``Once upon a office sofa Iz ACA King investigate likeness ancestorRegarding speaker dive Dum wavesMagikarp Gleaming Authorization Asset hamHor Clinton''}
+  \item \textbf{Top-$p=0.8$.} \textit{``Once upon a retroald Continuous Istanbul '/ Issa kids recourse fa Gly EMP ($) Dig ProxybpJu ceilings Railwayiversityイト''}
+  \item \textbf{Top-$p=0.95$.} \textit{``Once upon a Saulfocus340headed Dietaryindividual ideologicallyCW intendederen contributMA tours ML Contribut Nottingham European CHRIST Readers dere''}
+  \item \textbf{Top-$p=1.0$.} \textit{``Once upon a Jordan speciesotomy started Cousoccupied Shootifestyle DRMBoot Colorsinav Sit Actionuren dunk now 29 rarity Nguyen''}
+  \item \textbf{Takeaway.} Higher $p$ values admit a larger tail of low-probability tokens, yielding more diverse (but noisier) completions. Greedy decoding sticks to the modal choice and repeats motifs, while $p=1.0$ allows maximum randomness.
+\end{itemize}
+
 \section*{Performance Comparison Strategy}
 \begin{itemize}[leftmargin=*]
   \item \textbf{Feasibility.} It is practical to compare all three architectures visually: log training loss and wall-clock time per step for each variant while running identical hyperparameters, then plot the metrics using \texttt{matplotlib} inside the standalone notebook. GPU execution is optional but accelerates experimentation.

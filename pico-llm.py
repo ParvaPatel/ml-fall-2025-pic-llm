@@ -3,6 +3,7 @@ import argparse
 import time
 import random
 import math
+from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -475,6 +476,30 @@ RECORDED_KGRAM_BENCHMARK = [
     },
 ]
 
+# Recorded texts from the updated nucleus sampler after a short sanity run.
+RECORDED_NUCLEUS_EXAMPLES = [
+    {
+        "top_p": None,
+        "label": "Greedy",
+        "text": "Once upon a office sofa Iz ACA King investigate likeness ancestorRegarding speaker dive Dum wavesMagikarp Gleaming Authorization Asset hamHor Clinton",
+    },
+    {
+        "top_p": 0.8,
+        "label": "Top-p = 0.8",
+        "text": "Once upon a retroald Continuous Istanbul '/ Issa kids recourse fa Gly EMP ($) Dig ProxybpJu ceilings Railwayiversityイト",
+    },
+    {
+        "top_p": 0.95,
+        "label": "Top-p = 0.95",
+        "text": "Once upon a Saulfocus340headed Dietaryindividual ideologicallyCW intendederen contributMA tours ML Contribut Nottingham European CHRIST Readers dere",
+    },
+    {
+        "top_p": 1.0,
+        "label": "Top-p = 1.0",
+        "text": "Once upon a Jordan speciesotomy started Cousoccupied Shootifestyle DRMBoot Colorsinav Sit Actionuren dunk now 29 rarity Nguyen",
+    },
+]
+
 
 ################################################################################
 # 4. LSTM-based seq2seq
@@ -533,8 +558,44 @@ def monosemantic_analysis_for_token(token_id, model, enc, device="cpu", top_n=5)
 # 7. Single code path for text generation
 ################################################################################
 
-def nucleus_sampling(logits, p=0.95):
-    return torch.argmax(logits).item()
+def nucleus_sampling(logits: torch.Tensor, p: float = 0.95) -> int:
+    """
+    Sample a token from `logits` using nucleus (top-p) sampling.
+
+    Nucleus sampling sorts tokens by probability mass, keeps the smallest
+    prefix whose cumulative probability exceeds p, and samples uniformly
+    from that truncated distribution.
+    """
+    # Convert logits to probabilities with softmax for numerical stability.
+    probs = torch.softmax(logits, dim=-1)
+
+    # Sort probabilities in descending order and keep associated token indices.
+    sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+
+    # Compute cumulative probability mass.
+    cumulative = torch.cumsum(sorted_probs, dim=-1)
+
+    # Identify the cut-off mask where cumulative mass first exceeds p.
+    cutoff_mask = cumulative > p
+
+    # Ensure we always keep at least one token by shifting the mask.
+    if torch.any(cutoff_mask):
+        # Find the index of the first token that pushes us over the threshold.
+        first_over_threshold = torch.argmax(cutoff_mask.float()).item()
+        # Retain tokens up to and including that index.
+        keep = sorted_probs[: first_over_threshold + 1]
+        keep_indices = sorted_indices[: first_over_threshold + 1]
+    else:
+        # If total mass never exceeds p, keep the entire distribution.
+        keep = sorted_probs
+        keep_indices = sorted_indices
+
+    # Renormalize the kept probabilities to sum to one.
+    keep = keep / keep.sum()
+
+    # Sample a token ID according to the renormalized distribution.
+    sampled_idx = torch.multinomial(keep, num_samples=1)
+    return keep_indices[sampled_idx].item()
 
 
 def generate_text(model, enc, init_text, max_new_tokens=20, device="cpu",
