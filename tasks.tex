@@ -35,5 +35,57 @@
         We plan to repeat the sanity check on TinyStories once Transformer and k-gram models are implemented, capture training curves for the required figures, and verify qualitative outputs under true top-$p$ sampling to demonstrate improved diversity.
 \end{enumerate}
 
+\section*{KGramMLPSeqModel Design Options}
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{Baseline One-Hot MLP.}\\
+        \textit{Structure:} Flatten the $k$ one-hot context vectors into a $(k \times |V|)$ input and feed through stacked Linear $\rightarrow$ SiLU blocks ending in a Linear layer to logits.\\
+        \textit{Pros:} Direct translation of the docstring; simplest to reason about; no extra embeddings needed.\\
+        \textit{Cons:} Extremely high input dimensionality (tens of thousands) makes each forward/backward pass slow and memory hungry; scales poorly with larger vocab or $k$.\\
+        \textit{Performance expectations:} Works for tiny vocab toy data but may be impractical for full TinyStories unless chunking is aggressive.
+  \item \textbf{Token Embedding + MLP (Shared Projection).}\\
+        \textit{Structure:} Map each context token through a learned embedding matrix ($|V| \rightarrow d$), concatenate the $k$ embeddings (size $k \times d$), then apply a compact MLP that projects back to vocabulary logits.\\
+        \textit{Pros:} Input dimensionality drops dramatically; parameters scale with $d$ instead of $|V|$; embeddings can be reused or initialized from LSTM/Transformer values.\\
+        \textit{Cons:} Slightly more complex; must ensure embeddings are trained jointly; loses the “pure” one-hot formulation.\\
+        \textit{Performance expectations:} Much faster and fits GPU memory; still expressive enough for k-gram patterns when $d$ is moderate.
+  \item \textbf{Embedding + Depthwise 1D Convolution Hybrid.}\\
+        \textit{Structure:} Embed tokens as above, stack along temporal dimension, then use 1D convolution(s) over the $k$ context positions followed by a projection to logits.\\
+        \textit{Pros:} Weight sharing across positions reduces parameters; convolutional kernels capture local order efficiently; fits well with chunked inference.\\
+        \textit{Cons:} Deviates from strict MLP requirement; requires reshaping logic in the provided forward loop; debugging convolutional behavior may be harder.\\
+        \textit{Performance expectations:} Efficient on GPU and handles longer $k$ gracefully; offers inductive bias similar to CNNs for n-gram features.
+\end{enumerate}
+
+\section*{Action Plan: Implementing KGramMLPSeqModel}
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{Select architecture.} Choose between one-hot MLP, embedding-based MLP, or convolution hybrid based on desired trade-offs.
+  \item \textbf{Define network layers.} Instantiate embedding (if needed), hidden Linear layers with activation, dropout if desired, and final Linear layer to $|V|$ logits.
+  \item \textbf{Integrate into forward loop.} Replace the \texttt{self.net = None} stub and ensure tensors are moved to the correct device, handling chunked processing without altering the provided outer loops.
+  \item \textbf{Add safety checks.} Validate input shapes, raise informative errors if \texttt{self.net} is misconfigured, and confirm gradients flow through embeddings.
+  \item \textbf{Test in notebook.} Run the reduced configuration from the sanity check, compare loss trajectories, and profile runtime to confirm expected improvements.
+\end{enumerate}
+
+\section*{Performance Comparison Strategy}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Feasibility.} It is practical to compare all three architectures visually: log training loss and wall-clock time per step for each variant while running identical hyperparameters, then plot the metrics using \texttt{matplotlib} inside the standalone notebook. GPU execution is optional but accelerates experimentation.
+  \item \textbf{Instrumentation plan.}
+    \begin{itemize}[leftmargin=1.5em,label=\textbf{--}]
+      \item Wrap the training loop to record (loss, step, elapsed seconds) tuples for each KGramMLPSeqModel option via separate helper functions.
+      \item Store results in a shared list or \texttt{pandas} DataFrame, noting architecture label and configuration (e.g., embedding dimension).
+      \item After each run, generate line plots for loss vs. step and bar charts for tokens/sec to highlight efficiency differences.
+    \end{itemize}
+  \item \textbf{Caveats.} Full TinyStories runs may be slow in Colab CPU mode; expect to subsample the dataset or limit training steps for a fair yet tractable comparison. Ensure random seeds are fixed for reproducibility.
+\end{itemize}
+
+\section*{Empirical Results (Synthetic Corpus)}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Setup.} CPU only; k=2, embedding size 64, two inner MLP layers, Adam with learning rate $1\\times 10^{-3}$, 20 mini-batches per variant (batch size 32) over the \texttt{3seqs.txt} dataset.
+  \item \textbf{Metrics.}
+    \begin{itemize}[leftmargin=1.5em,label=\textbf{--}]
+      \item One-hot MLP: average loss $\\approx 10.63$, throughput $\\approx 17.6$ tokens/s, runtime $\\approx 1161$ seconds.
+      \item Embedding MLP: average loss $\\approx 9.49$, throughput $\\approx 42.3$ tokens/s, runtime $\\approx 485$ seconds.
+      \item Conv Hybrid: average loss $\\approx 10.23$, throughput $\\approx 32.3$ tokens/s, runtime $\\approx 634$ seconds.
+    \end{itemize}
+  \item \textbf{Decision.} The embedding-based MLP achieves the best trade-off (lowest loss and highest throughput), so we will proceed with this architecture for the full implementation and upcoming experiments.
+\end{itemize}
+
 \end{document}
 

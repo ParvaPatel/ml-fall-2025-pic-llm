@@ -152,17 +152,60 @@ class KGramMLPSeqModel(nn.Module):
     Potentially very large memory usage for big vocab or seq_len. chunk_size helps mitigate overhead.
     """
 
-    def __init__(self, vocab_size, k=3, embed_size=1024, num_inner_layers=1, chunk_size=1):
+    def __init__(
+        self,
+        vocab_size,
+        k=3,
+        embed_size=1024,
+        num_inner_layers=1,
+        chunk_size=1,
+        variant: str = "embedding",
+        hidden_dim: int = 512,
+        conv_hidden_dim: int = 512,
+        allow_alt_variants: bool = False,
+    ):
         super().__init__()
-        self.k = k
-        self.vocab_size = vocab_size
-        self.embed_size = embed_size
-        self.num_inner_layers = num_inner_layers
-        self.chunk_size = chunk_size
+        self.k = k  # store how many previous tokens form the context window
+        self.vocab_size = vocab_size  # total vocabulary size for output logits
+        self.embed_size = embed_size  # embedding dimension for variants that use embeddings
+        self.num_inner_layers = num_inner_layers  # number of hidden layers inside the MLP
+        self.chunk_size = chunk_size  # process timesteps in micro-batches to save memory
 
-        # fill in
-
-        self.net = None
+        # Select the concrete sub-network for processing each k-gram context.
+        variant = variant.lower()
+        if variant != "embedding" and not allow_alt_variants:
+            raise ValueError(
+                f"KGramMLPSeqModel variant '{variant}' requires allow_alt_variants=True "
+                "to prevent accidental use of slower experimental architectures."
+            )
+        if variant == "onehot":
+            # Pure one-hot MLP consuming (k * vocab_size) features.
+            self.net = build_kgram_onehot_mlp(
+                vocab_size=self.vocab_size,
+                k=self.k,
+                hidden_dim=hidden_dim,
+                num_inner_layers=self.num_inner_layers,
+            )
+        elif variant == "embedding":
+            # Embedding-based MLP that projects tokens into a smaller space.
+            self.net = build_kgram_embedding_mlp(
+                vocab_size=self.vocab_size,
+                k=self.k,
+                embed_dim=self.embed_size,
+                hidden_dim=hidden_dim,
+                num_inner_layers=self.num_inner_layers,
+            )
+        elif variant == "conv":
+            # Embedding + depthwise convolution hybrid.
+            self.net = build_kgram_conv_mlp(
+                vocab_size=self.vocab_size,
+                k=self.k,
+                embed_dim=self.embed_size,
+                hidden_dim=conv_hidden_dim,
+            )
+        else:
+            raise ValueError(f"Unknown KGramMLPSeqModel variant '{variant}'.")
+        self.variant = variant  # store which variant we instantiated for logging
 
     def forward(self, tokens_seq):
         """
@@ -170,37 +213,139 @@ class KGramMLPSeqModel(nn.Module):
         return: (seq_len, batch, vocab_size)
         We'll do a loop over time steps. chunk_size can reduce overhead.
         """
-        seq_len, batch_size = tokens_seq.shape
-        outputs = []
+        seq_len, batch_size = tokens_seq.shape  # unpack sequence and batch dimensions
+        outputs = []  # collect logits chunks for each processed window
 
-        start = 0
+        start = 0  # begin at the first timestep
         while start < seq_len:
-            end = min(start + self.chunk_size, seq_len)
-            block_outputs = []
+            end = min(start + self.chunk_size, seq_len)  # determine micro-batch end
+            block_outputs = []  # store logits for timesteps within this micro-batch
             for t in range(start, end):
-                batch_logits = []
+                batch_logits = []  # accumulate logits for each sequence in the batch
                 for b in range(batch_size):
                     if t < self.k:
+                        # Not enough history; pad with zeros on the left.
                         needed = self.k - t
-                        context_ids = [0]*needed + tokens_seq[:t, b].tolist()
+                        context_ids = [0] * needed + tokens_seq[:t, b].tolist()
                     else:
-                        context_ids = tokens_seq[t-self.k:t, b].tolist()
+                        # Extract the last k tokens as context.
+                        context_ids = tokens_seq[t - self.k : t, b].tolist()
 
                     context_oh = F.one_hot(
                         torch.tensor(context_ids, dtype=torch.long, device=tokens_seq.device),
-                        num_classes=self.vocab_size
-                    )
-                    context_flat = context_oh.flatten().float().unsqueeze(0)
-                    logits_b = self.net(context_flat)  # (1, vocab_size)
-                    batch_logits.append(logits_b)
-                block_outputs.append(torch.cat(batch_logits, dim=0).unsqueeze(0))  # (1, batch, vocab_size)
+                        num_classes=self.vocab_size,
+                    )  # shape: (k, vocab_size)
+                    context_flat = context_oh.flatten().float().unsqueeze(0)  # reshape to (1, k*vocab)
+                    logits_b = self.net(context_flat)  # forward through chosen variant -> (1, vocab_size)
+                    batch_logits.append(logits_b)  # append logits for this batch element
+                # Stack logits for all batch items and add timestep dimension.
+                block_outputs.append(torch.cat(batch_logits, dim=0).unsqueeze(0))
 
+            # Concatenate logits for timesteps processed in this micro-batch.
             block_outputs = torch.cat(block_outputs, dim=0)  # (chunk_size, batch, vocab_size)
-            outputs.append(block_outputs)
-            start = end
+            outputs.append(block_outputs)  # store micro-batch result
+            start = end  # advance to next chunk
 
-        outputs = torch.cat(outputs, dim=0)  # (seq_len, batch, vocab_size)
+        # Concatenate along time dimension to recover (seq_len, batch, vocab_size).
+        outputs = torch.cat(outputs, dim=0)
         return outputs
+
+def build_kgram_onehot_mlp(vocab_size: int, k: int, hidden_dim: int, num_inner_layers: int) -> nn.Sequential:
+    """
+    Return a simple MLP that expects flattened one-hot inputs of size (k * vocab_size).
+    """
+    layers = []
+    input_dim = k * vocab_size
+    current_dim = hidden_dim
+    layers.append(nn.Linear(input_dim, hidden_dim))
+    layers.append(nn.SiLU())
+    for _ in range(max(num_inner_layers - 1, 0)):
+        layers.append(nn.Linear(current_dim, hidden_dim))
+        layers.append(nn.SiLU())
+    layers.append(nn.Linear(current_dim, vocab_size))
+    return nn.Sequential(*layers)
+
+
+class KGramEmbeddingMLP(nn.Module):
+    """
+    Use a learnable token embedding before feeding an MLP.
+    Input is still the flattened one-hot vector from the outer forward loop.
+    """
+
+    def __init__(self, vocab_size: int, k: int, embed_dim: int, hidden_dim: int, num_inner_layers: int):
+        super().__init__()
+        self.k = k
+        self.vocab_size = vocab_size
+        self.embed = nn.Embedding(vocab_size, embed_dim)
+        layers = []
+        input_dim = k * embed_dim
+        current_dim = hidden_dim
+        layers.append(nn.Linear(input_dim, hidden_dim))
+        layers.append(nn.SiLU())
+        for _ in range(max(num_inner_layers - 1, 0)):
+            layers.append(nn.Linear(current_dim, hidden_dim))
+            layers.append(nn.SiLU())
+        layers.append(nn.Linear(current_dim, vocab_size))
+        self.mlp = nn.Sequential(*layers)
+
+    def forward(self, context_flat: torch.Tensor) -> torch.Tensor:
+        batch = context_flat.size(0)
+        context = context_flat.view(batch, self.k, self.vocab_size)
+        embedded = torch.matmul(context, self.embed.weight)  # (batch, k, embed_dim)
+        x = embedded.reshape(batch, -1)
+        return self.mlp(x)
+
+
+class KGramConvEmbeddingMLP(nn.Module):
+    """
+    Combine embeddings with depthwise convolution to capture order-sensitive features.
+    """
+
+    def __init__(self, vocab_size: int, k: int, embed_dim: int, hidden_dim: int):
+        super().__init__()
+        self.k = k
+        self.vocab_size = vocab_size
+        self.embed = nn.Embedding(vocab_size, embed_dim)
+        kernel_size = max(1, k)
+        self.depthwise_conv = nn.Conv1d(
+            in_channels=embed_dim,
+            out_channels=embed_dim,
+            kernel_size=kernel_size,
+            groups=embed_dim,
+            bias=False,
+        )
+        self.pointwise = nn.Conv1d(embed_dim, hidden_dim, kernel_size=1)
+        self.activation = nn.SiLU()
+        self.head = nn.Linear(hidden_dim, vocab_size)
+
+    def forward(self, context_flat: torch.Tensor) -> torch.Tensor:
+        batch = context_flat.size(0)
+        context = context_flat.view(batch, self.k, self.vocab_size)
+        embedded = torch.matmul(context, self.embed.weight)  # (batch, k, embed_dim)
+        emb = embedded.permute(0, 2, 1)  # (batch, embed_dim, k)
+        conv_out = self.depthwise_conv(emb)
+        conv_out = self.pointwise(conv_out)  # (batch, hidden_dim, output_len)
+        pooled = conv_out.mean(dim=-1)
+        x = self.activation(pooled)
+        return self.head(x)
+
+
+def build_kgram_embedding_mlp(
+    vocab_size: int, k: int, embed_dim: int, hidden_dim: int, num_inner_layers: int
+) -> KGramEmbeddingMLP:
+    """
+    Helper to instantiate the embedding-based MLP variant.
+    """
+    return KGramEmbeddingMLP(vocab_size, k, embed_dim, hidden_dim, num_inner_layers)
+
+
+def build_kgram_conv_mlp(
+    vocab_size: int, k: int, embed_dim: int, hidden_dim: int
+) -> KGramConvEmbeddingMLP:
+    """
+    Helper to instantiate the convolutional hybrid variant.
+    """
+    return KGramConvEmbeddingMLP(vocab_size, k, embed_dim, hidden_dim)
 
 
 ################################################################################
