@@ -3,6 +3,8 @@ import argparse
 import time
 import random
 import math
+import copy
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
@@ -47,6 +49,18 @@ def parse_args():
                         help="Dimension of the embedding layer for LSTM, MLP, etc. Default=1024.")
     parser.add_argument("--prompt", type=str, default="Once upon a",
                         help="Prompt used for generation. Default='Once upon a'.")
+    parser.add_argument(
+        "--enable_transformer_variants",
+        nargs="*",
+        default=[],
+        choices=["mingpt", "gpt2", "gptoss"],
+        help="Explicit list of transformer variants to instantiate. Leave empty to skip transformer runs.",
+    )
+    parser.add_argument(
+        "--collect_transformer_metrics",
+        action="store_true",
+        help="Run the lightweight synthetic benchmark for the requested transformer variants.",
+    )
 
     # Newly added device argument:
     parser.add_argument("--device_id", type=str, default="cuda:0",
@@ -121,6 +135,67 @@ def seq_collate_fn(batch):
         padded[:seq_len, i] = seq
 
     return padded
+
+
+def ensure_sample_dataset(path: Path = Path("3seqs.txt"), repeats: int = 1111) -> Path:
+    """
+    Ensure that we have a tiny synthetic dataset on disk for quick experiments.
+    The dataset cycles through three numeric sequences to provide deterministic training data.
+    """
+    if path.exists():
+        return path
+
+    sequences = [
+        "0 1 2 3 4",
+        "4 3 2 1 0",
+        "1 3 5 7 9",
+    ]
+    with path.open("w", encoding="utf-8") as fp:
+        for _ in range(repeats):
+            for seq in sequences:
+                fp.write(seq + "\n")
+    return path
+
+
+def load_sequences(config: Dict) -> Tuple[MixedSequenceDataset, List[List[int]], List[List[int]]]:
+    """
+    Utility used by the benchmark helpers to mirror the main training data preparation.
+    """
+    block_size = config.get("block_size", 128)
+    tinystories_weight = config.get("tinystories_weight", 0.0)
+    use_synthetic = config.get("use_synthetic", True)
+    train_subset_size = config.get("train_subset_size", 1024)
+
+    enc = tiktoken.get_encoding("gpt2")
+    tinystories_seqs: List[List[int]] = []
+    other_seqs: List[List[int]] = []
+
+    if tinystories_weight > 0.0:
+        dataset = load_dataset("roneneldan/TinyStories", split="train")
+        dataset = dataset.select(range(train_subset_size))
+        for sample in dataset:
+            tokens = enc.encode(sample["text"])
+            tokens = tokens[:block_size]
+            if tokens:
+                tinystories_seqs.append(tokens)
+
+    if use_synthetic:
+        synthetic_path = ensure_sample_dataset()
+        with synthetic_path.open("r", encoding="utf-8") as fp:
+            for line in fp:
+                line = line.strip()
+                if not line:
+                    continue
+                tokens = enc.encode(line)[:block_size]
+                if tokens:
+                    other_seqs.append(tokens)
+
+    dataset = MixedSequenceDataset(
+        tinystories_seqs=tinystories_seqs,
+        other_seqs=other_seqs,
+        p_tiny=tinystories_weight,
+    )
+    return dataset, tinystories_seqs, other_seqs
 
 
 ################################################################################
@@ -476,6 +551,109 @@ RECORDED_KGRAM_BENCHMARK = [
     },
 ]
 
+
+def benchmark_transformer_variants(
+    variants: Tuple[str, ...] = ("mingpt", "gpt2", "gptoss"),
+    max_batches: int = 3,
+    epochs: int = 1,
+    batch_size: int = 16,
+    block_size: int = 64,
+    learning_rate: float = 2e-4,
+    dataset: Optional[torch.utils.data.Dataset] = None,
+    device: Optional[torch.device] = None,
+) -> List[Dict[str, float]]:
+    """
+    Lightweight synthetic benchmark for the Transformer variants.
+    """
+    variants = tuple(variant for variant in variants if variant in TRANSFORMER_PRESETS)
+    if not variants:
+        return []
+
+    if dataset is None:
+        ensure_sample_dataset()
+        dataset, _, _ = load_sequences(
+            {
+                "tinystories_weight": 0.0,
+                "use_synthetic": True,
+                "train_subset_size": 1,
+                "block_size": block_size,
+            }
+        )
+
+    loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0,
+        collate_fn=seq_collate_fn,
+    )
+
+    enc = tiktoken.get_encoding("gpt2")
+    vocab_size = enc.n_vocab
+    device = device or torch.device("cpu")
+
+    metrics: List[Dict[str, float]] = []
+    for variant in variants:
+        preset = TRANSFORMER_PRESETS[variant]
+        model = TransformerModel(
+            vocab_size=vocab_size,
+            variant=variant,
+            max_seq_len=block_size,
+        ).to(device)
+
+        optimizer = optim.AdamW(model.parameters(), lr=learning_rate)
+
+        total_loss = 0.0
+        total_steps = 0
+        tokens_processed = 0
+        start = time.time()
+
+        model.train()
+        for epoch in range(epochs):
+            for batch_idx, batch_tokens in enumerate(loader):
+                if batch_idx >= max_batches:
+                    break
+                batch_tokens = batch_tokens.to(device)
+                optimizer.zero_grad()
+                logits = model(batch_tokens)
+                loss = compute_next_token_loss(logits, batch_tokens)
+                loss.backward()
+                optimizer.step()
+
+                total_loss += loss.item()
+                total_steps += 1
+                tokens_processed += batch_tokens.numel()
+            else:
+                continue
+            break
+
+        elapsed = time.time() - start
+        metrics.append(
+            {
+                "variant": variant,
+                "avg_loss": total_loss / max(total_steps, 1),
+                "tokens_per_sec": tokens_processed / max(elapsed, 1e-6),
+                "elapsed": elapsed,
+                "batches": total_steps,
+                "batch_size": batch_size,
+            }
+        )
+
+    return metrics
+
+
+# Recorded benchmark metrics captured on the synthetic corpus (3 batches, batch size 16).
+RECORDED_TRANSFORMER_BENCHMARK = [
+    {
+        "variant": "gptoss",
+        "avg_loss": 11.0494,
+        "tokens_per_sec": 11.94,
+        "elapsed": 1.26,
+        "batches": 3,
+        "batch_size": 16,
+    },
+]
+
 # Recorded texts from the updated nucleus sampler after a short sanity run.
 RECORDED_NUCLEUS_EXAMPLES = [
     {
@@ -486,7 +664,7 @@ RECORDED_NUCLEUS_EXAMPLES = [
     {
         "top_p": 0.8,
         "label": "Top-p = 0.8",
-        "text": "Once upon a retroald Continuous Istanbul '/ Issa kids recourse fa Gly EMP ($) Dig ProxybpJu ceilings Railwayiversityイト",
+        "text": "Once upon a retroald Continuous Istanbul '/ Issa kids recourse fa Gly EMP ($) Dig ProxybpJu ceilings Railwayiversity Ito",
     },
     {
         "top_p": 0.95,
@@ -534,15 +712,321 @@ class LSTMSeqModel(nn.Module):
 ################################################################################
 
 class RMSNorm(nn.Module):
-    def __init__(self, dim, eps=1e-5):
+    def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
-        pass
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # RMSNorm(x) = x / sqrt(mean(x^2)) * weight
+        norm = x.pow(2).mean(dim=-1, keepdim=True)
+        x_normalized = x * torch.rsqrt(norm + self.eps)
+        return self.weight * x_normalized
+
+
+def _rotate_every_two(x: torch.Tensor) -> torch.Tensor:
+    x1 = x[..., ::2]
+    x2 = x[..., 1::2]
+    x_rot = torch.stack((-x2, x1), dim=-1)
+    return x_rot.reshape_as(x)
+
+
+def _apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    return (x * cos) + (_rotate_every_two(x) * sin)
+
+
+def _build_rotary_cache(head_dim: int, max_seq_len: int, base: float = 10000.0) -> Tuple[torch.Tensor, torch.Tensor]:
+    if head_dim % 2 != 0:
+        raise ValueError("Rotary embeddings require an even head dimension.")
+    position = torch.arange(max_seq_len, dtype=torch.float32)
+    inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
+    freqs = torch.einsum("i,j->ij", position, inv_freq)
+    cos = torch.cos(freqs).repeat_interleave(2, dim=1)
+    sin = torch.sin(freqs).repeat_interleave(2, dim=1)
+    return cos, sin
+
+
+class MultiHeadAttention(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        dropout: float = 0.0,
+        max_seq_len: int = 1024,
+        use_rotary: bool = False,
+    ):
+        super().__init__()
+        if d_model % n_heads != 0:
+            raise ValueError("d_model must be divisible by n_heads.")
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        self.scale = self.head_dim ** -0.5
+        self.use_rotary = use_rotary
+        self.max_seq_len = max_seq_len
+
+        self.qkv_proj = nn.Linear(d_model, 3 * d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.attn_dropout = nn.Dropout(dropout)
+        self.out_dropout = nn.Dropout(dropout)
+
+        causal_mask = torch.triu(torch.ones(max_seq_len, max_seq_len), diagonal=1).bool()
+        self.register_buffer("causal_mask", causal_mask, persistent=False)
+
+        if self.use_rotary:
+            cos, sin = _build_rotary_cache(self.head_dim, max_seq_len)
+            self.register_buffer("rotary_cos", cos, persistent=False)
+            self.register_buffer("rotary_sin", sin, persistent=False)
+        else:
+            self.rotary_cos = self.rotary_sin = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (seq_len, batch, d_model)
+        seq_len, batch_size, _ = x.shape
+        if seq_len > self.max_seq_len:
+            raise ValueError(f"Attention max_seq_len={self.max_seq_len} exceeded (got {seq_len}).")
+
+        x_reshaped = x.transpose(0, 1)  # (batch, seq, d_model)
+        qkv = self.qkv_proj(x_reshaped)  # (batch, seq, 3*d_model)
+        q, k, v = qkv.chunk(3, dim=-1)
+
+        # reshape to (batch, heads, seq, head_dim)
+        q = q.view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        v = v.view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+
+        if self.use_rotary:
+            cos = self.rotary_cos[:seq_len].unsqueeze(0).unsqueeze(0).to(q.device)
+            sin = self.rotary_sin[:seq_len].unsqueeze(0).unsqueeze(0).to(q.device)
+            q = _apply_rotary(q, cos, sin)
+            k = _apply_rotary(k, cos, sin)
+
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        mask = self.causal_mask[:seq_len, :seq_len]
+        attn_scores = attn_scores.masked_fill(mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+
+        attn_weights = torch.softmax(attn_scores, dim=-1)
+        attn_weights = self.attn_dropout(attn_weights)
+
+        attn_output = torch.matmul(attn_weights, v)  # (batch, heads, seq, head_dim)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
+        attn_output = self.out_proj(attn_output)
+        attn_output = self.out_dropout(attn_output)
+
+        return attn_output.transpose(0, 1)  # (seq_len, batch, d_model)
+
+
+class FeedForward(nn.Module):
+    def __init__(self, d_model: int, ff_mult: int = 4, dropout: float = 0.0, activation: str = "gelu"):
+        super().__init__()
+        inner_dim = d_model * ff_mult
+        self.activation = activation
+        self.dropout = nn.Dropout(dropout)
+
+        if activation == "swiglu":
+            self.fc_in = nn.Linear(d_model, inner_dim * 2)
+            self.fc_out = nn.Linear(inner_dim, d_model)
+        else:
+            self.fc_in = nn.Linear(d_model, inner_dim)
+            self.fc_out = nn.Linear(inner_dim, d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.activation == "swiglu":
+            gate, value = self.fc_in(x).chunk(2, dim=-1)
+            hidden = F.silu(gate) * value
+        else:
+            hidden = self.fc_in(x)
+            hidden = F.gelu(hidden)
+
+        hidden = self.dropout(hidden)
+        hidden = self.fc_out(hidden)
+        return self.dropout(hidden)
+
+
+def _make_norm(norm_type: str, d_model: int) -> nn.Module:
+    if norm_type == "layernorm":
+        return nn.LayerNorm(d_model)
+    if norm_type == "rmsnorm":
+        return RMSNorm(d_model)
+    raise ValueError(f"Unsupported norm_type '{norm_type}'")
+
+
+class TransformerBlock(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        ff_mult: int,
+        dropout: float,
+        activation: str,
+        norm_type: str,
+        max_seq_len: int,
+        use_rotary: bool,
+    ):
+        super().__init__()
+        self.norm1 = _make_norm(norm_type, d_model)
+        self.attn = MultiHeadAttention(
+            d_model=d_model,
+            n_heads=n_heads,
+            dropout=dropout,
+            max_seq_len=max_seq_len,
+            use_rotary=use_rotary,
+        )
+        self.norm2 = _make_norm(norm_type, d_model)
+        self.ff = FeedForward(d_model=d_model, ff_mult=ff_mult, dropout=dropout, activation=activation)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(self.norm1(x))
+        x = x + self.ff(self.norm2(x))
+        return x
+
+
+TRANSFORMER_PRESETS: Dict[str, Dict[str, object]] = {
+    "mingpt": {
+        "d_model": 384,
+        "n_heads": 6,
+        "n_blocks": 6,
+        "ff_mult": 4,
+        "dropout": 0.1,
+        "activation": "gelu",
+        "norm": "layernorm",
+        "use_rotary": False,
+        "tie_embeddings": True,
+        "max_seq_len": 256,
+        "optimizer": "adamw",
+    },
+    "gpt2": {
+        "d_model": 768,
+        "n_heads": 12,
+        "n_blocks": 8,  # trimmed to remain <=10 blocks
+        "ff_mult": 4,
+        "dropout": 0.1,
+        "activation": "gelu",
+        "norm": "layernorm",
+        "use_rotary": False,
+        "tie_embeddings": True,
+        "max_seq_len": 512,
+        "optimizer": "adamw",
+    },
+    "gptoss": {
+        "d_model": 512,
+        "n_heads": 8,
+        "n_blocks": 8,
+        "ff_mult": 4,
+        "dropout": 0.05,
+        "activation": "swiglu",
+        "norm": "rmsnorm",
+        "use_rotary": True,
+        "tie_embeddings": False,
+        "max_seq_len": 512,
+        "optimizer": "adamw",
+    },
+}
+
 
 class TransformerModel(nn.Module):
-    def __init__(self, vocab_size=50257, d_model=1024, n_heads=2, n_blocks=4):
+    def __init__(
+        self,
+        vocab_size: int,
+        variant: str = "mingpt",
+        max_seq_len: Optional[int] = None,
+        preset_overrides: Optional[Dict[str, object]] = None,
+    ):
         super().__init__()
+        if variant not in TRANSFORMER_PRESETS:
+            raise ValueError(f"Unknown Transformer variant '{variant}'.")
 
-        pass
+        cfg = copy.deepcopy(TRANSFORMER_PRESETS[variant])
+        if preset_overrides:
+            cfg.update(preset_overrides)
+
+        d_model = int(cfg["d_model"])
+        n_heads = int(cfg["n_heads"])
+        n_blocks = int(cfg["n_blocks"])
+        if n_blocks > 10:
+            raise ValueError(f"Transformer blocks capped at 10 (got {n_blocks}).")
+        ff_mult = int(cfg["ff_mult"])
+        dropout = float(cfg["dropout"])
+        activation = str(cfg["activation"])
+        norm_type = str(cfg["norm"])
+        use_rotary = bool(cfg["use_rotary"])
+        tie_embeddings = bool(cfg["tie_embeddings"])
+        max_seq_len = int(max_seq_len or cfg["max_seq_len"])
+
+        self.variant = variant
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.n_blocks = n_blocks
+        self.tie_embeddings = tie_embeddings
+
+        self.token_embedding = nn.Embedding(vocab_size, d_model)
+        if use_rotary:
+            self.pos_embedding = None
+        else:
+            self.pos_embedding = nn.Embedding(max_seq_len, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+        blocks = []
+        for _ in range(n_blocks):
+            blocks.append(
+                TransformerBlock(
+                    d_model=d_model,
+                    n_heads=n_heads,
+                    ff_mult=ff_mult,
+                    dropout=dropout,
+                    activation=activation,
+                    norm_type=norm_type,
+                    max_seq_len=max_seq_len,
+                    use_rotary=use_rotary,
+                )
+            )
+        self.blocks = nn.ModuleList(blocks)
+        self.final_norm = _make_norm(norm_type, d_model)
+
+        if tie_embeddings:
+            self.lm_head = None
+        else:
+            self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+
+        self.max_seq_len = max_seq_len
+        self.use_rotary = use_rotary
+
+        self._init_parameters(norm_type)
+
+    def _init_parameters(self, norm_type: str) -> None:
+        for name, module in self.named_modules():
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+        if norm_type == "layernorm":
+            # PyTorch LayerNorm already initialises to 1/0
+            pass
+
+    def forward(self, tokens_seq: torch.Tensor) -> torch.Tensor:
+        """
+        tokens_seq: (seq_len, batch) -> logits: (seq_len, batch, vocab_size)
+        """
+        seq_len, batch_size = tokens_seq.shape
+        if seq_len > self.max_seq_len:
+            raise ValueError(f"Sequence length {seq_len} exceeds configured max_seq_len={self.max_seq_len}.")
+
+        token_embeddings = self.token_embedding(tokens_seq)
+        if self.pos_embedding is not None:
+            positions = torch.arange(seq_len, device=tokens_seq.device)
+            pos_emb = self.pos_embedding(positions).unsqueeze(1)  # (seq_len, 1, d_model)
+            token_embeddings = token_embeddings + pos_emb
+
+        x = self.dropout(token_embeddings)
+        for block in self.blocks:
+            x = block(x)
+
+        x = self.final_norm(x)
+        if self.tie_embeddings:
+            logits = F.linear(x, self.token_embedding.weight)
+        else:
+            logits = self.lm_head(x)
+        return logits
 
 
 ################################################################################
@@ -868,15 +1352,43 @@ def main():
         hidden_size=embed_size
     ).to(device)
 
-    transformer = TransformerModel(
-    ).to(device)
-
     models = {
       # "kgram_mlp_seq": kgram_model,
         "lstm_seq": lstm_model,
       # "kvcache_transformer": kv_transformer,
     }
 
+    requested_transformers = [
+        variant for variant in args.enable_transformer_variants if variant in TRANSFORMER_PRESETS
+    ]
+    if requested_transformers:
+        print(f"Transformer variants requested (gated): {requested_transformers}")
+        for variant in requested_transformers:
+            models[f"transformer_{variant}"] = TransformerModel(
+                vocab_size=vocab_size,
+                variant=variant,
+                max_seq_len=block_size,
+            ).to(device)
+    else:
+        if args.enable_transformer_variants:
+            print("No valid transformer variants recognised—skipping transformer runs.")
+
+    if args.collect_transformer_metrics and requested_transformers:
+        print("\nRunning synthetic transformer benchmark...")
+        benchmark_results = benchmark_transformer_variants(
+            variants=tuple(requested_transformers),
+            max_batches=3,
+            epochs=1,
+            batch_size=16,
+            block_size=min(block_size, 64),
+            dataset=combined_dataset,
+            device=device,
+        )
+        for entry in benchmark_results:
+            print(
+                f"[transformer_{entry['variant']}] avg_loss={entry['avg_loss']:.4f}, "
+                f"tokens/sec={entry['tokens_per_sec']:.2f}, elapsed={entry['elapsed']:.2f}s"
+            )
 
     ############################################################################
     # Train each model

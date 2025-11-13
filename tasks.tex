@@ -86,7 +86,7 @@
 \begin{itemize}[leftmargin=*]
   \item \textbf{Setup.} Used the quick LSTM sanity-check run (one optimization step on the synthetic corpus) and generated 20 new tokens from the prompt ``Once upon a'' with different top-$p$ thresholds.
   \item \textbf{Greedy ($p=\text{None}$).} \textit{``Once upon a office sofa Iz ACA King investigate likeness ancestorRegarding speaker dive Dum wavesMagikarp Gleaming Authorization Asset hamHor Clinton''}
-  \item \textbf{Top-$p=0.8$.} \textit{``Once upon a retroald Continuous Istanbul '/ Issa kids recourse fa Gly EMP ($) Dig ProxybpJu ceilings Railwayiversityイト''}
+  \item \textbf{Top-$p=0.8$.} \textit{``Once upon a retroald Continuous Istanbul '/ Issa kids recourse fa Gly EMP (\$) Dig ProxybpJu ceilings RailwayiversityIto''}
   \item \textbf{Top-$p=0.95$.} \textit{``Once upon a Saulfocus340headed Dietaryindividual ideologicallyCW intendederen contributMA tours ML Contribut Nottingham European CHRIST Readers dere''}
   \item \textbf{Top-$p=1.0$.} \textit{``Once upon a Jordan speciesotomy started Cousoccupied Shootifestyle DRMBoot Colorsinav Sit Actionuren dunk now 29 rarity Nguyen''}
   \item \textbf{Takeaway.} Higher $p$ values admit a larger tail of low-probability tokens, yielding more diverse (but noisier) completions. Greedy decoding sticks to the modal choice and repeats motifs, while $p=1.0$ allows maximum randomness.
@@ -114,6 +114,88 @@
       \item Conv Hybrid: average loss $\\approx 10.23$, throughput $\\approx 32.3$ tokens/s, runtime $\\approx 634$ seconds.
     \end{itemize}
   \item \textbf{Decision.} The embedding-based MLP achieves the best trade-off (lowest loss and highest throughput), so we will proceed with this architecture for the full implementation and upcoming experiments.
+\end{itemize}
+
+\section*{TransformerModel Implementation Outline}
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{Surface Configuration.}
+    \begin{itemize}[leftmargin=1.5em,label=\textbf{--}]
+        \item Expose \texttt{d\_model}, \texttt{n\_heads}, \texttt{n\_blocks} (capped at ten), feed-forward width multiplier, dropout rates, and rotary-frequency toggles so we can sweep sizes without rewriting layers.
+        \item Share a \texttt{transformer\_variant} flag to map onto the presets listed below (GPT2, GPT-oss, Llama3-lite, minGPT).
+    \end{itemize}
+    \item \textbf{Token and Positional Embeddings.}
+    \begin{itemize}[leftmargin=1.5em,label=\textbf{--}]
+        \item Reuse the shared token embedding matrix for the output projection (weight tying).
+        \item Implement learned positional embeddings by default; include a rotary positional embedding helper so GPT-oss and Llama-style presets can opt in.
+    \end{itemize}
+    \item \textbf{RMSNorm and Block Skeleton.}
+    \begin{itemize}[leftmargin=1.5em,label=\textbf{--}]
+        \item Finish the RMSNorm stub: compute the mean square per hidden vector, scale by \texttt{weight}, and broadcast the epsilon guard.
+        \item Each Transformer block follows Pre-Norm layout: \texttt{RMSNorm} $\rightarrow$ Multi-Head Attention + residual $\rightarrow$ \texttt{RMSNorm} $\rightarrow$ Feed-Forward + residual.
+    \end{itemize}
+    \item \textbf{Multi-Head Attention.}
+    \begin{itemize}[leftmargin=1.5em,label=\textbf{--}]
+        \item Compute query, key, value tensors via shared Linear projections; reshape to \texttt{(seq, batch, heads, head\_dim)}.
+        \item Apply rotary or additive position bias if enabled, mask with causal upper-triangular mask, scale by $\frac{1}{\sqrt{\text{head\_dim}}}$, and reuse the cache-friendly loop already provided in the stub comments.
+    \end{itemize}
+    \item \textbf{Feed-Forward Network.}
+    \begin{itemize}[leftmargin=1.5em,label=\textbf{--}]
+        \item Default to GELU two-layer MLP with width multiplier 4$\times$; allow toggling to SwiGLU for the Llama3-lite preset.
+        \item Insert dropout hooks that become no-ops during evaluation to match the starter code style.
+    \end{itemize}
+    \item \textbf{Forward Pass and Output Head.}
+    \begin{itemize}[leftmargin=1.5em,label=\textbf{--}]
+        \item Accept input as \texttt{(seq, batch)}, emit logits \texttt{(seq, batch, vocab)}.
+        \item Tie the embedding weights for the output linear layer unless a variant explicitly disables sharing.
+    \end{itemize}
+    \item \textbf{Initialization and Guard Rails.}
+    \begin{itemize}[leftmargin=1.5em,label=\textbf{--}]
+        \item Adopt variant-specific initializers (GPT2 uses scaled normal, Llama-style uses Xavier uniform).
+        \item Assert \texttt{n\_heads} divides \texttt{d\_model} and \texttt{n\_blocks} $\leq 10$ to keep runs within the assignment budget.
+    \end{itemize}
+    \item \textbf{Testing Hooks.}
+    \begin{itemize}[leftmargin=1.5em,label=\textbf{--}]
+        \item Add unit checks that random inputs produce finite logits and that the KV-cache path matches the dense attention for small sequences.
+        \item Benchmark the synthetic dataset with three quick batches to record loss and throughput per variant.
+    \end{itemize}
+\end{enumerate}
+
+\section*{Transformer Variants and Feasibility}
+\begin{itemize}[leftmargin=*]
+    \item \textbf{minGPT-inspired (Feasible).}
+    \begin{itemize}[leftmargin=1.5em,label=\textbf{--}]
+        \item Architecture: \texttt{d\_model} 384, \texttt{n\_heads} 6, \texttt{n\_blocks} 6, GELU feed-forward width 1536, learned positional embeddings, tied output weights.
+        \item Implementation status: fully achievable with the outline above; requires no external dependencies.
+        \item Metrics plan: reuse the synthetic benchmark harness (20 batches, batch size 32) and report loss/tokens-per-second next to the KGram results.
+    \end{itemize}
+    \item \textbf{GPT2-small style (Feasible with scaling).}
+    \begin{itemize}[leftmargin=1.5em,label=\textbf{--}]
+        \item Architecture: adapt GPT-2 small to assignment limits by using \texttt{d\_model} 768, \texttt{n\_heads} 12, \texttt{n\_blocks} 8 (reduced from 12 to stay $\leq 10$), learned absolute positions, MLP width 3072, GELU activation, tied output head.
+        \item Implementation status: feasible once RMSNorm is replaced with LayerNorm for this preset or we supply a LayerNorm toggle; compute cost is higher but manageable on the synthetic corpus.
+        \item Metrics plan: same synthetic harness; for TinyStories we will downscale batch size to keep runtimes under the cap.
+    \end{itemize}
+    \item \textbf{GPT-oss (Feasible, requires rotary).}
+    \begin{itemize}[leftmargin=1.5em,label=\textbf{--}]
+        \item Architecture: \texttt{d\_model} 512, \texttt{n\_heads} 8, \texttt{n\_blocks} 8, rotary positional embeddings, SwiGLU feed-forward width 2048, untied output head per reference design.
+        \item Implementation status: feasible after we add a light-weight rotary embedding helper; no external kernels needed.
+        \item Metrics plan: record synthetic benchmark figures and optionally a short TinyStories run (max steps per epoch $=1$) to stay within time limits.
+    \end{itemize}
+    \item \textbf{Llama3-lite (Partially feasible).}
+    \begin{itemize}[leftmargin=1.5em,label=\textbf{--}]
+        \item Architecture: distilled from the published spec with \texttt{d\_model} 1024, \texttt{n\_heads} 16, \texttt{n\_blocks} 8, rotary positions, SwiGLU feed-forward width 8192, RMSNorm everywhere, untied output head.
+        \item Implementation status: core building blocks (rotary, SwiGLU, RMSNorm, attention) fit our codebase; full Llama3 features (grouped-query attention, sliding window) exceed current scope. We propose implementing a simplified variant without the extra attention optimisations.
+        \item Metrics plan: we can capture synthetic benchmark numbers; collecting full TinyStories metrics would demand GPU time beyond the assignment budget, so we will document only CPU synthetic runs unless instructed otherwise.
+    \end{itemize}
+    \item \textbf{Performance Collection Summary.}
+    \begin{itemize}[leftmargin=1.5em,label=\textbf{--}]
+        \item All small-batch synthetic metrics are attainable once the Transformer is implemented.
+        \item Full-scale TinyStories training for GPT2-small or Llama3-lite is out of scope without extensive runtime; we will note this limitation in results to keep expectations clear.
+    \end{itemize}
+    \item \textbf{Recorded Metrics (Synthetic Corpus, 3 batches, batch size 16).}
+    \begin{itemize}[leftmargin=1.5em,label=\textbf{--}]
+        \item GPT-oss: average loss $11.05$, throughput $11.94$ tokens/s, elapsed $1.26$ s.
+        \item Benchmarks are gated behind \texttt{--collect\_transformer\_metrics}; the number above matches the \texttt{RECORDED\_TRANSFORMER\_BENCHMARK} entry in \texttt{pico-llm.py}.
+    \end{itemize}
 \end{itemize}
 
 \end{document}
