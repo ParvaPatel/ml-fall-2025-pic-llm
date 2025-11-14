@@ -40,6 +40,8 @@ def parse_args():
                         help="Number of epochs to train each model (default: 3).")
     parser.add_argument("--batch_size", type=int, default=16,
                         help="Mini-batch size for training/evaluation (default: 16).")
+    parser.add_argument("--learning_rate", type=float, default=1e-3,
+                        help="Learning rate for the optimizers (default: 1e-3).")
     parser.add_argument("--tinystories_weight", type=float, default=0.5,
                         help="Probability of sampling from TinyStories if present. Default=0.5. (set to 0.0 to skip TinyStories).")
     parser.add_argument("--max_steps_per_epoch", type=int, default=None,
@@ -1315,7 +1317,7 @@ def main():
     embed_size = args.embed_size
     batch_size = args.batch_size
     num_epochs = args.num_epochs
-    learning_rate = 1e-3
+    learning_rate = args.learning_rate
 
     block_size = args.block_size
     train_subset_size = 20000
@@ -1586,6 +1588,15 @@ def main():
             "test_split_ratio": split_ratio,
             "per_path_counts": per_path_counts,
             "custom_eval_count": custom_eval_count,
+            "hyperparameters": {
+                "embed_size": embed_size,
+                "block_size": block_size,
+                "batch_size": batch_size,
+                "num_epochs": num_epochs,
+                "learning_rate": learning_rate,
+                "kgram_k": k,
+                "kgram_chunk_size": chunk_size,
+            },
             "model_metrics": run_metrics,
             "prompt": args.prompt,
         }

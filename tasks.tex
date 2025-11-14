@@ -125,6 +125,21 @@
   \item \textbf{Initial Run.} Executed a 30-epoch sweep (batch size 4) on a 43-sequence subset; metrics recorded in \texttt{artefacts/overfitting\_sweep.json} now feed the notebook plot highlighting the divergence between training and testing losses.
 \end{itemize}
 
+\section*{Optional Task: General Hyperparameter Study (Plan)}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Objective.} Systematically explore non-learned settings (embedding size, block size, number of LSTM layers, Transformer heads/blocks, learning rate, batch size) to see how they affect convergence speed, loss, and sample quality.
+  \item \textbf{Experimental Grid.}
+    \begin{itemize}[leftmargin=1.5em,label=\textbf{--}]
+      \item \textbf{Scope.} Focus on a manageable subset: e.g., embedding sizes $\{256, 512, 1024\}$, block sizes $\{32, 64, 128\}$, LSTM layers $\{1, 2\}$, Transformer heads $\{4, 8\}$, learning rates $\{5{\\times}10^{-4}, 1{\\times}10^{-3}\}$.
+      \item \textbf{Models.} Run both LSTM and GPT-oss for each hyperparameter combo.
+      \item \textbf{Budget.} Fix a moderate training budget (e.g., 10 epochs, batch size 8) to keep runtimes tractable while still reflecting differences.
+    \end{itemize}
+  \item \textbf{Metrics.} Log training/testing loss, tokens-per-second, and representative generations. Store results in \texttt{artefacts/hparam\_sweep.json} for notebook visualisation (e.g., heatmaps or spider plots).
+  \item \textbf{Notebook Integration.} Add a “General Hyperparameter Study” section that pulls the JSON results and highlights the best-performing configurations along with trade-offs (quality vs. speed).
+  \item \textbf{Deliverables.} Produce plots comparing loss vs. embedding size, loss vs. learning rate, etc., summarise key findings, and note recommendations for the final presentation.
+  \item \textbf{Initial Runs.} Logged three configurations (\texttt{emb256/block32/lr5e-4}, \texttt{emb512/block64/lr1e-3}, \texttt{emb1024/block128/lr2e-3}) to \texttt{artefacts/hparam\_sweep.json}; the notebook now visualises their training/testing losses side by side.
+\end{itemize}
+
 \section*{Empirical Results (Synthetic Corpus)}
 \begin{itemize}[leftmargin=*]
   \item \textbf{Setup.} CPU only; k=2, embedding size 64, two inner MLP layers, Adam with learning rate $1\\times 10^{-3}$, 20 mini-batches per variant (batch size 32) over the \texttt{3seqs.txt} dataset.
