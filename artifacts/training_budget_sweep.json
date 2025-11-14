@@ -127,5 +127,55 @@
       }
     },
     "prompt": "once upon a time"
+  },
+  {
+    "timestamp": 1763141650.5490189,
+    "tinystories_sequences": 20000,
+    "custom_sequences": 0,
+    "base_sequences": 3,
+    "total_sequences": 3,
+    "tinystories_weight": 1.0,
+    "limit_custom_examples": null,
+    "test_split_ratio": 0.4,
+    "per_path_counts": {
+      "/Users/mengziyue/csga_2565_ml/pico-llm/3seqs.txt": 3
+    },
+    "custom_eval_count": 0,
+    "hyperparameters": {
+      "embed_size": 512,
+      "block_size": 64,
+      "batch_size": 4,
+      "num_epochs": 3,
+      "learning_rate": 0.001,
+      "kgram_k": 3,
+      "kgram_chunk_size": 1
+    },
+    "model_metrics": {
+      "lstm_seq": {
+        "epoch_losses": [
+          10.563995997111002,
+          8.388732671737671,
+          6.544179598490397
+        ],
+        "final_loss": 6.544179598490397,
+        "total_steps": 18,
+        "elapsed": 17.632733821868896,
+        "eval_losses": [],
+        "final_eval_loss": null
+      },
+      "transformer_gptoss": {
+        "epoch_losses": [
+          9.35388215382894,
+          6.715535958607991,
+          5.262871106465657
+        ],
+        "final_loss": 5.262871106465657,
+        "total_steps": 18,
+        "elapsed": 35.71765398979187,
+        "eval_losses": [],
+        "final_eval_loss": null
+      }
+    },
+    "prompt": "once upon a time"
   }
 ]
