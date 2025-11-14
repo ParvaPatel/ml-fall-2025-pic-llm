@@ -98,8 +98,8 @@
   \item \textbf{Loader Updates.} Added \texttt{--input\_dir} (recursive \texttt{*.txt} discovery) and \texttt{--limit\_custom\_examples} flags so we can point the trainer at an entire folder or trim the number of custom lines for quick tests.
   \item \textbf{Usage.} Example command: \texttt{OMP\_NUM\_THREADS=1 python3 pico-llm.py --tinystories\_weight 0.25 --input\_dir data/custom\_corpus --block\_size 64 --max\_steps\_per\_epoch 1 --enable\_transformer\_variants gptoss}.
   \item \textbf{Result Snapshot.} A quick smoke test with \texttt{--tinystories\_weight 0.25} + the custom corpus loads 182 additional sequences and trains without errors. Even with the one-step-per-epoch cap the models start echoing the new terms (“drone”, “lighthouse”, “meteorite”) instead of the numeric toy lines, confirming that the loader now ingests richer data sources.
-  \item \textbf{Loss Sweep.} Recorded short runs at four corpus sizes (3, 63, 123, 185 sequences) with \texttt{--custom\_sweep\_log artefacts/custom\_data\_sweep.json}. The notebook plots the final epoch loss for LSTM and GPT-oss versus corpus size, showing monotonic loss reduction for LSTM and a gentler decline for GPT-oss as more custom data is added.
-  \item \textbf{Training Budget Sweep.} Logged fixed-corpus runs with increasing steps per epoch (1, 3, 6) under a 60/40 train/test split. Stored metrics in \texttt{artefacts/training\_budget\_sweep.json}; the notebook visualises how additional gradient steps lower both train and eval losses, clarifying that the earlier loss rise was due to under-training.
+  \item \textbf{Loss Sweep.} Recorded short runs at four corpus sizes (3, 63, 123, 185 sequences) with \texttt{--custom\_sweep\_log artifacts/custom\_data\_sweep.json}. The notebook plots the final epoch loss for LSTM and GPT-oss versus corpus size, showing monotonic loss reduction for LSTM and a gentler decline for GPT-oss as more custom data is added.
+  \item \textbf{Training Budget Sweep.} Logged fixed-corpus runs with increasing steps per epoch (1, 3, 6) under a 60/40 train/test split. Stored metrics in \texttt{artifacts/training\_budget\_sweep.json}; the notebook visualises how additional gradient steps lower both train and eval losses, clarifying that the earlier loss rise was due to under-training.
   \item \textbf{Next Steps.} Curate a larger custom directory (possibly user transcripts or domain notes) and run longer schedules while logging per-source sampling weights. Compose qualitative comparisons between TinyStories-only and blended corpora for the presentation.
 \end{itemize}
 
@@ -121,8 +121,8 @@
   \item \textbf{Subset Selection.} Sample 20--30 sequences from the custom directory, maintain a 60/40 train/test split so the held-out portion remains informative.
   \item \textbf{Training Schedule.} Run extended schedules (e.g., up to 100 gradient steps) with periodic checkpoints. Capture training/testing loss pairs as well as qualitative generations to observe memorisation.
   \item \textbf{Architectures.} Repeat the procedure for both LSTM and GPT-oss to compare how quickly each model memorises the small dataset.
-  \item \textbf{Artefacts.} Log metrics to a new JSON file (e.g., \texttt{artefacts/overfitting\_sweep.json}) so the notebook can add a dedicated plot once runs are complete.
-  \item \textbf{Initial Run.} Executed a 30-epoch sweep (batch size 4) on a 43-sequence subset; metrics recorded in \texttt{artefacts/overfitting\_sweep.json} now feed the notebook plot highlighting the divergence between training and testing losses.
+  \item \textbf{Artifacts.} Log metrics to a new JSON file (e.g., \texttt{artifacts/overfitting\_sweep.json}) so the notebook can add a dedicated plot once runs are complete.
+  \item \textbf{Initial Run.} Executed a 30-epoch sweep (batch size 4) on a 43-sequence subset; metrics recorded in \texttt{artifacts/overfitting\_sweep.json} now feed the notebook plot highlighting the divergence between training and testing losses.
 \end{itemize}
 
 \section*{Optional Task: General Hyperparameter Study (Plan)}
@@ -134,10 +134,10 @@
       \item \textbf{Models.} Run both LSTM and GPT-oss for each hyperparameter combo.
       \item \textbf{Budget.} Fix a moderate training budget (e.g., 10 epochs, batch size 8) to keep runtimes tractable while still reflecting differences.
     \end{itemize}
-  \item \textbf{Metrics.} Log training/testing loss, tokens-per-second, and representative generations. Store results in \texttt{artefacts/hparam\_sweep.json} for notebook visualisation (e.g., heatmaps or spider plots).
+  \item \textbf{Metrics.} Log training/testing loss, tokens-per-second, and representative generations. Store results in \texttt{artifacts/hparam\_sweep.json} for notebook visualisation (e.g., heatmaps or spider plots).
   \item \textbf{Notebook Integration.} Add a “General Hyperparameter Study” section that pulls the JSON results and highlights the best-performing configurations along with trade-offs (quality vs. speed).
   \item \textbf{Deliverables.} Produce plots comparing loss vs. embedding size, loss vs. learning rate, etc., summarise key findings, and note recommendations for the final presentation.
-  \item \textbf{Initial Runs.} Logged three configurations (\texttt{emb256/block32/lr5e-4}, \texttt{emb512/block64/lr1e-3}, \texttt{emb1024/block128/lr2e-3}) to \texttt{artefacts/hparam\_sweep.json}; the notebook now visualises their training/testing losses side by side.
+  \item \textbf{Initial Runs.} Logged three configurations (\texttt{emb256/block32/lr5e-4}, \texttt{emb512/block64/lr1e-3}, \texttt{emb1024/block128/lr2e-3}) to \texttt{artifacts/hparam\_sweep.json}; the notebook now visualises their training/testing losses side by side.
 \end{itemize}
 
 \section*{Empirical Results (Synthetic Corpus)}
