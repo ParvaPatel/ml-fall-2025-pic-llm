@@ -4,13 +4,14 @@ import time
 import random
 import math
 import copy
+import json
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-
 # We do not import numpy or scikit-learn, so we implement a naive k-means in pure PyTorch.
 # If you prefer scikit-learn, you can adapt the code.
 
@@ -25,6 +26,20 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train multiple k-gram or sequence-based models on TinyStories and/or custom text files.")
     parser.add_argument("--input_files", nargs="*", default=None,
                         help="Optional list of text files to mix in as data sources. Each line is one example (up to block_size).")
+    parser.add_argument("--input_dir", type=str, default=None,
+                        help="If set, recursively load every *.txt file under this directory as additional training data.")
+    parser.add_argument("--limit_custom_examples", type=int, default=None,
+                        help="Optional cap on the number of custom text lines to ingest (useful for quick smoke tests).")
+    parser.add_argument("--custom_sweep_log", type=str, default=None,
+                        help="Optional JSON file to append loss metrics for custom-data sweeps.")
+    parser.add_argument("--record_custom_sweep", action="store_true",
+                        help="If set, store loss metrics for plotting custom-data sweeps.")
+    parser.add_argument("--test_split_ratio", type=float, default=None,
+                        help="If set, reserve this fraction of each custom file for evaluation (only when recording sweeps).")
+    parser.add_argument("--num_epochs", type=int, default=3,
+                        help="Number of epochs to train each model (default: 3).")
+    parser.add_argument("--batch_size", type=int, default=16,
+                        help="Mini-batch size for training/evaluation (default: 16).")
     parser.add_argument("--tinystories_weight", type=float, default=0.5,
                         help="Probability of sampling from TinyStories if present. Default=0.5. (set to 0.0 to skip TinyStories).")
     parser.add_argument("--max_steps_per_epoch", type=int, default=None,
@@ -645,10 +660,26 @@ def benchmark_transformer_variants(
 # Recorded benchmark metrics captured on the synthetic corpus (3 batches, batch size 16).
 RECORDED_TRANSFORMER_BENCHMARK = [
     {
+        "variant": "mingpt",
+        "avg_loss": 234.1350,
+        "tokens_per_sec": 26.33,
+        "elapsed": 0.57,
+        "batches": 3,
+        "batch_size": 16,
+    },
+    {
+        "variant": "gpt2",
+        "avg_loss": 360.2983,
+        "tokens_per_sec": 9.35,
+        "elapsed": 1.60,
+        "batches": 3,
+        "batch_size": 16,
+    },
+    {
         "variant": "gptoss",
-        "avg_loss": 11.0494,
-        "tokens_per_sec": 11.94,
-        "elapsed": 1.26,
+        "avg_loss": 10.9343,
+        "tokens_per_sec": 12.36,
+        "elapsed": 1.21,
         "batches": 3,
         "batch_size": 16,
     },
@@ -677,6 +708,8 @@ RECORDED_NUCLEUS_EXAMPLES = [
         "text": "Once upon a Jordan speciesotomy started Cousoccupied Shootifestyle DRMBoot Colorsinav Sit Actionuren dunk now 29 rarity Nguyen",
     },
 ]
+
+RECORDED_CUSTOM_DATA_SWEEP: List[Dict[str, object]] = []
 
 
 ################################################################################
@@ -1154,7 +1187,8 @@ def train_one_model(model,
                     max_steps_per_epoch=None,
                     enc=None,
                     monosemantic_info=None,
-                    prompt="Once upon a"):
+                    prompt="Once upon a",
+                    eval_loader=None):
     """
     We add `prompt` as an explicit argument so we can pass it down from main().
     """
@@ -1163,6 +1197,9 @@ def train_one_model(model,
     start_time = time.time()
     next_sample_time = start_time
     global_step = 0
+
+    epoch_losses: List[float] = []
+    eval_losses: List[float] = []
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -1238,6 +1275,30 @@ def train_one_model(model,
 
         avg_loss = total_loss / step_in_epoch
         print(f"[{model_name}] *** End of Epoch {epoch} *** Avg Loss: {avg_loss:.4f}")
+        epoch_losses.append(avg_loss)
+        if eval_loader is not None:
+            model.eval()
+            eval_total = 0.0
+            eval_batches = 0
+            with torch.no_grad():
+                for eval_batch in eval_loader:
+                    eval_batch = eval_batch.to(device)
+                    logits = model(eval_batch)
+                    loss = compute_next_token_loss(logits, eval_batch)
+                    eval_total += loss.item()
+                    eval_batches += 1
+            eval_losses.append(eval_total / max(eval_batches, 1))
+            model.train()
+
+    training_summary = {
+        "epoch_losses": epoch_losses,
+        "final_loss": epoch_losses[-1] if epoch_losses else None,
+        "total_steps": global_step,
+        "elapsed": time.time() - start_time,
+        "eval_losses": eval_losses,
+        "final_eval_loss": eval_losses[-1] if eval_losses else None,
+    }
+    return training_summary
 
 
 ################################################################################
@@ -1252,8 +1313,8 @@ def main():
     chunk_size = args.kgram_chunk_size
 
     embed_size = args.embed_size
-    batch_size = 16
-    num_epochs = 3
+    batch_size = args.batch_size
+    num_epochs = args.num_epochs
     learning_rate = 1e-3
 
     block_size = args.block_size
@@ -1301,22 +1362,91 @@ def main():
                 tinystories_seqs.append(tokens)
         print(f"TinyStories sequences: {len(tinystories_seqs)}")
 
+    custom_paths: List[Tuple[Path, str]] = []
     if args.input_files:
-        for filepath in args.input_files:
-            print(f"Reading custom text file: {filepath}")
+        custom_paths.extend((Path(p).expanduser(), "file") for p in args.input_files)
+    if args.input_dir:
+        input_dir = Path(args.input_dir).expanduser()
+        if not input_dir.exists():
+            raise FileNotFoundError(f"--input_dir {input_dir} does not exist.")
+        dir_files = sorted(p for p in input_dir.rglob("*.txt") if p.is_file())
+        if not dir_files:
+            print(f"Warning: --input_dir {input_dir} contains no *.txt files.")
+        custom_paths.extend((p, "dir") for p in dir_files)
+
+    seen_paths: Dict[Path, str] = {}
+    unique_paths: List[Tuple[Path, str]] = []
+    for path, source in custom_paths:
+        resolved = path.resolve()
+        if resolved.is_file() and resolved not in seen_paths:
+            seen_paths[resolved] = source
+            unique_paths.append((resolved, source))
+
+    per_path_counts: Dict[str, int] = {}
+    dir_loaded = 0
+    split_ratio = args.test_split_ratio
+    custom_limit = args.limit_custom_examples
+    custom_eval: List[List[int]] = []
+    per_path_eval_counts: Dict[str, int] = {}
+    if unique_paths:
+        print(f"Reading {len(unique_paths)} custom text file(s)...")
+        for filepath, source in unique_paths:
+            print(f"  -> {filepath}")
+            file_train = []
+            file_eval = []
             with open(filepath, "r", encoding="utf-8") as f:
-                lines = f.readlines()
-            for line in lines:
-                line = line.strip()
-                if not line:
-                    continue
-                tokens = enc.encode(line)
-                tokens = tokens[:block_size]
-                if len(tokens) > 0:
-                    other_seqs.append(tokens)
-        print(f"Custom input files: {len(other_seqs)} sequences loaded.")
+                for line in f:
+                    if custom_limit is not None and source == "dir" and dir_loaded >= custom_limit:
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
+                    tokens = enc.encode(line)
+                    tokens = tokens[:block_size]
+                    if len(tokens) == 0:
+                        continue
+                    add_to_eval = False
+                    if split_ratio is not None and source == "dir":
+                        total_so_far = per_path_counts.get(str(filepath), 0) + per_path_eval_counts.get(str(filepath), 0)
+                        if total_so_far > 0:
+                            eval_fraction = per_path_eval_counts.get(str(filepath), 0) / float(total_so_far)
+                        else:
+                            eval_fraction = 0.0
+                        add_to_eval = eval_fraction < split_ratio
+                    if add_to_eval:
+                        file_eval.append(torch.tensor(tokens, dtype=torch.long))
+                        per_path_eval_counts[str(filepath)] = per_path_eval_counts.get(str(filepath), 0) + 1
+                    else:
+                        file_train.append(tokens)
+                        other_seqs.append(tokens)
+                        per_path_counts[str(filepath)] = per_path_counts.get(str(filepath), 0) + 1
+                        if source == "dir":
+                            dir_loaded += 1
+                    if custom_limit is not None and source == "dir" and dir_loaded >= custom_limit:
+                        break
+            custom_eval.extend(file_eval)
+        print(f"Custom text sequences loaded: {len(other_seqs)}")
     else:
-        print("No custom input files provided.")
+        print("No custom text files provided.")
+
+    custom_eval_count = len(custom_eval)
+    eval_loader = None
+    if custom_eval_count > 0:
+        eval_loader = torch.utils.data.DataLoader(
+            custom_eval,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=0,
+            collate_fn=seq_collate_fn,
+        )
+
+    custom_sequence_count = 0
+    base_sequence_count = 0
+    for path_str, count in per_path_counts.items():
+        if Path(path_str).name == "3seqs.txt":
+            base_sequence_count += count
+        else:
+            custom_sequence_count += count
 
     p_tiny = args.tinystories_weight
     if len(tinystories_seqs) == 0 and p_tiny>0:
@@ -1393,9 +1523,11 @@ def main():
     ############################################################################
     # Train each model
     ############################################################################
+    run_metrics: Dict[str, Dict[str, object]] = {}
+
     for model_name, model in models.items():
         print(f"\n=== Training model: {model_name} ===")
-        train_one_model(
+        summary = train_one_model(
             model=model,
             loader=train_loader,
             epochs=num_epochs,
@@ -1406,8 +1538,10 @@ def main():
             sample_interval=sample_interval_seconds,
             max_steps_per_epoch=max_steps_per_epoch,
             enc=enc,
-            prompt=args.prompt  # <--- Pass the user-specified prompt here
+            prompt=args.prompt,  # <--- Pass the user-specified prompt here
+            eval_loader=eval_loader
         )
+        run_metrics[model_name] = summary
 
         # Final generation from the user-provided prompt (args.prompt).
         with torch.no_grad():
@@ -1439,6 +1573,40 @@ def main():
         print(text_topp1)
         print(f"Annotated:\n{ann_topp1}")
         print("--------------------------------------------------")
+
+    if args.record_custom_sweep or args.custom_sweep_log:
+        sweep_entry = {
+            "timestamp": time.time(),
+            "tinystories_sequences": len(tinystories_seqs),
+            "custom_sequences": custom_sequence_count,
+            "base_sequences": base_sequence_count,
+            "total_sequences": len(other_seqs),
+            "tinystories_weight": args.tinystories_weight,
+            "limit_custom_examples": custom_limit,
+            "test_split_ratio": split_ratio,
+            "per_path_counts": per_path_counts,
+            "custom_eval_count": custom_eval_count,
+            "model_metrics": run_metrics,
+            "prompt": args.prompt,
+        }
+        if args.record_custom_sweep:
+            RECORDED_CUSTOM_DATA_SWEEP.append(sweep_entry)
+        if args.custom_sweep_log:
+            log_path = Path(args.custom_sweep_log).expanduser()
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            if log_path.exists():
+                try:
+                    existing = json.loads(log_path.read_text())
+                    if not isinstance(existing, list):
+                        existing = []
+                except json.JSONDecodeError:
+                    print(f"Warning: could not parse existing log at {log_path}, starting fresh.")
+                    existing = []
+            else:
+                existing = []
+            existing.append(sweep_entry)
+            log_path.write_text(json.dumps(existing, indent=2))
+            print(f"Wrote custom sweep metrics to {log_path}")
 
     # Finally, let's share how I'm feeling:
     print("\n*** I'm feeling great today! Hope you're well, too. ***")
