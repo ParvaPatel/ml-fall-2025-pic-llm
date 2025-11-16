@@ -82,6 +82,13 @@ def parse_args():
     # Newly added device argument:
     parser.add_argument("--device_id", type=str, default="cuda:0",
                         help="Torch device identifier (default='cuda:0'). If CUDA is unavailable, fallback to 'cpu'.")
+    # Evaluation on TinyStories and checkpointing
+    parser.add_argument("--tinystories_eval_ratio", type=float, default=None,
+                        help="If set and tinystories_weight>0, reserve this fraction of TinyStories for evaluation.")
+    parser.add_argument("--save_checkpoints", action="store_true",
+                        help="If set, save model checkpoints after training.")
+    parser.add_argument("--checkpoint_dir", type=str, default="artifacts/checkpoints",
+                        help="Directory to save checkpoints when --save_checkpoints is set.")
 
     args = parser.parse_args()
     return args
@@ -1341,6 +1348,7 @@ def main():
     # Data
     ############################################################################
     tinystories_seqs = []
+    tinystories_eval_seqs: List[List[int]] = []
     other_seqs = []
 
     if args.tinystories_weight > 0.0:
@@ -1356,13 +1364,31 @@ def main():
     print(f"Vocab size: {vocab_size}")
 
     if dataset is not None:
-        for sample in dataset:
+        # Optionally split TinyStories into train/eval
+        eval_ratio = args.tinystories_eval_ratio
+        if eval_ratio is not None and 0.0 < eval_ratio < 1.0:
+            ds_len = len(dataset)
+            split_idx = int(ds_len * (1.0 - eval_ratio))
+            train_ds = dataset.select(range(split_idx))
+            eval_ds = dataset.select(range(split_idx, ds_len))
+        else:
+            train_ds = dataset
+            eval_ds = None
+
+        for sample in train_ds:
             text = sample['text']
             tokens = enc.encode(text)
             tokens = tokens[:block_size]
             if len(tokens) > 0:
                 tinystories_seqs.append(tokens)
-        print(f"TinyStories sequences: {len(tinystories_seqs)}")
+        if eval_ds is not None:
+            for sample in eval_ds:
+                text = sample['text']
+                tokens = enc.encode(text)
+                tokens = tokens[:block_size]
+                if len(tokens) > 0:
+                    tinystories_eval_seqs.append(tokens)
+        print(f"TinyStories sequences: {len(tinystories_seqs)} (train), {len(tinystories_eval_seqs)} (eval)")
 
     custom_paths: List[Tuple[Path, str]] = []
     if args.input_files:
@@ -1433,9 +1459,14 @@ def main():
 
     custom_eval_count = len(custom_eval)
     eval_loader = None
-    if custom_eval_count > 0:
+    if custom_eval_count > 0 or len(tinystories_eval_seqs) > 0:
+        combined_eval: List[torch.Tensor] = []
+        if custom_eval_count > 0:
+            combined_eval.extend(custom_eval)
+        if len(tinystories_eval_seqs) > 0:
+            combined_eval.extend(torch.tensor(seq, dtype=torch.long) for seq in tinystories_eval_seqs)
         eval_loader = torch.utils.data.DataLoader(
-            custom_eval,
+            combined_eval,
             batch_size=batch_size,
             shuffle=False,
             num_workers=0,
@@ -1544,6 +1575,18 @@ def main():
             eval_loader=eval_loader
         )
         run_metrics[model_name] = summary
+
+        # Save checkpoint if requested
+        if args.save_checkpoints:
+            ckpt_dir = Path(args.checkpoint_dir).expanduser()
+            ckpt_dir.mkdir(parents=True, exist_ok=True)
+            weight_str = f"{args.tinystories_weight}".replace(".", "_")
+            ckpt_path = ckpt_dir / f"{model_name}_weight_{weight_str}.pt"
+            try:
+                torch.save(model.state_dict(), ckpt_path)
+                print(f"Saved checkpoint to {ckpt_path}")
+            except Exception as e:
+                print(f"Warning: failed to save checkpoint to {ckpt_path}: {e}")
 
         # Final generation from the user-provided prompt (args.prompt).
         with torch.no_grad():

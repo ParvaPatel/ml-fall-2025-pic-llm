@@ -44,12 +44,15 @@ def run_weight(weight):
         "python3", "pico-llm.py",
         "--tinystories_weight", str(weight),
         "--test_split_ratio", "0.4",
+        "--tinystories_eval_ratio", "0.2",
         "--record_custom_sweep",
         "--custom_sweep_log", str(temp_log),
         "--enable_transformer_variants", "gptoss",
         "--num_epochs", "3",
         "--batch_size", "16",
         "--max_steps_per_epoch", "50",
+        "--save_checkpoints",
+        "--checkpoint_dir", "artifacts/checkpoints",
         "--device_id", "cpu"
     ]
     
